@@ -30,6 +30,7 @@ use soroban_sdk::{
     contract, contractevent, contractimpl, panic_with_error, vec, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, TryFromVal, Val,
 };
+pub use types::NO_POLICY_DIGEST;
 pub use types::{
     CheckDetail, Error, PolicyConfig, ProtocolRule, RecipientCap, RecipientWindowState,
 };
@@ -51,11 +52,19 @@ struct EventAuthChecked {
     context_index: u32,
 }
 
-/// Agent heartbeat: data `at` (unix seconds).
+/// Agent heartbeat: data `at` (unix seconds) and `expires_at` — the
+/// attested dead-man-switch deadline as it stood at emission time, derived
+/// from the *current* policy's `dms_grace_secs` (`at + dms_grace_secs`).
+/// `0` when the dead-man switch is disabled (`dms_grace_secs == 0`, which is
+/// also how a missing policy reads). Recording the deadline on the event means
+/// a consumer no longer recomputes it from whatever the policy happens to be
+/// after a later `set_policy`; the event states the deadline it was attested
+/// under (SPEC §9).
 #[contractevent]
 #[derive(Clone)]
 struct EventHeartbeat {
     at: u64,
+    expires_at: u64,
 }
 
 /// Admin lifecycle events: data `by` (the admin address that acted).
@@ -299,8 +308,8 @@ fn emit_auth(env: &Env, allowed: bool, reason: Option<Error>, context_index: u32
     .publish(env);
 }
 
-fn emit_heartbeat(env: &Env, at: u64) {
-    EventHeartbeat { at }.publish(env);
+fn emit_heartbeat(env: &Env, at: u64, expires_at: u64) {
+    EventHeartbeat { at, expires_at }.publish(env);
 }
 
 fn emit_initialized(env: &Env, by: &Address) {
@@ -429,6 +438,9 @@ impl PolicyEngine {
     /// host verifies the registered agent's signature and the engine applies
     /// the account gates, so a heartbeat after the grace window expired — or
     /// while admin-frozen — is rejected.
+    ///
+    /// Reads and writes: `Policy` (read, for the DMS grace at emission time)
+    /// and `LastHeartbeat` (read + write).
     pub fn heartbeat(env: Env) {
         env.current_contract_address().require_auth();
         let now = env.ledger().timestamp();
@@ -441,7 +453,19 @@ impl PolicyEngine {
             return;
         }
         persist_set(&env, &DataKey::LastHeartbeat, &now);
-        emit_heartbeat(&env, now);
+        // Read the policy fresh here, at emission time, so the recorded
+        // deadline reflects the grace actually in force for this heartbeat and
+        // not a value cached from an earlier call. A missing policy or a zero
+        // `dms_grace_secs` means the dead-man switch is disabled, which the
+        // event records as `expires_at == 0` (SPEC §9).
+        let grace =
+            persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |cfg| cfg.dms_grace_secs);
+        let expires_at = if grace == 0 {
+            0
+        } else {
+            now.saturating_add(grace)
+        };
+        emit_heartbeat(&env, now, expires_at);
     }
 
     pub fn freeze(env: Env) {
@@ -472,6 +496,30 @@ impl PolicyEngine {
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn policy(env: Env) -> Option<PolicyConfig> {
         persist_get(&env, &DataKey::Policy)
+    }
+
+    /// Canonical encoding fingerprint for cheap policy drift detection
+    /// (`policy_hash`): SHA-256 over the deterministic canonical encoding of
+    /// the installed policy (SPEC §7.3), or `NO_POLICY_DIGEST` (the SHA-256 of
+    /// the empty marker, documented and never trapping) when no policy is
+    /// installed. No auth, event-free, and write-free. A returned hash only
+    /// changes when the *policy* changes — not on any other storage or ledger
+    /// activity — so SDKs/dashboards can detect drift by comparing one 32-byte
+    /// value instead of shipping and diffing the full `PolicyConfig`, and can
+    /// record the value alongside `auth_checked` events as a tamper-evident
+    /// log anchor.
+    ///
+    /// Off-chain reproduction is pinned by SPEC §7.3 (field order, per-field
+    /// encoding, sentinel value) and locked by `tests/policy_hash_encoding.rs`.
+    #[allow(clippy::must_use_candidate)] // public read surface
+    pub fn policy_hash(env: Env) -> BytesN<32> {
+        match persist_get::<PolicyConfig>(&env, &DataKey::Policy) {
+            None => BytesN::from_array(&env, &crate::types::NO_POLICY_DIGEST),
+            Some(cfg) => {
+                let encoding = crate::types::policy_canonical_encoding(&env, &cfg);
+                env.crypto().sha256(&encoding).into()
+            }
+        }
     }
 
     /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
@@ -748,6 +796,7 @@ impl CustomAccountInterface for PolicyEngine {
 #[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
 pub mod testutils {
     pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
+    pub use crate::types::policy_canonical_encoding;
     pub use crate::types::{
         CheckResult, DataKey, Error, PolicyConfig, ProtocolRule, RecipientCap,
         RecipientWindowState, Status, WindowState,
